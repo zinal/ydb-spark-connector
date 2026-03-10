@@ -7,7 +7,10 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicReference;
 
+import org.apache.spark.TaskContext;
+import org.apache.spark.executor.OutputMetrics;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.write.DataWriter;
 import org.apache.spark.sql.connector.write.WriterCommitMessage;
@@ -47,7 +50,8 @@ public abstract class YdbDataWriter implements DataWriter<InternalRow> {
     private final int maxConcurrency;
     private final Semaphore semaphore;
 
-    private final Map<CompletableFuture<?>, CompletableFuture<?>> writesInFly = new ConcurrentHashMap<>();
+    private final AtomicReference<WriteStats> writeStats = new AtomicReference<>();
+    private final Map<CompletableFuture<?>, WriteStats> writesInFly = new ConcurrentHashMap<>();
     private List<Value<?>> currentBatch = new ArrayList<>();
     private int currentBatchSize = 0;
     private volatile Status lastError = null;
@@ -93,9 +97,11 @@ public abstract class YdbDataWriter implements DataWriter<InternalRow> {
         semaphore.acquireUninterruptibly(maxConcurrency);
         semaphore.release(maxConcurrency);
 
+        updateStatistics();
+
         Status localError = lastError;
         if (localError != null) {
-            logger.warn("ydb writer got error {} on commit", localError);
+            logger.error("ydb writer got error on commit: {}", localError);
             localError.expectSuccess("cannot commit write");
         }
 
@@ -114,11 +120,23 @@ public abstract class YdbDataWriter implements DataWriter<InternalRow> {
     public void close() throws IOException {
     }
 
+    private void updateStatistics() {
+        WriteStats ws = writeStats.getAndSet(null);
+        if (ws != null && ws.isNonZero()) {
+            OutputMetrics om = TaskContext.get().taskMetrics().outputMetrics();
+            om.setRecordsWritten(om.recordsWritten() + ws.rows);
+            om.setBytesWritten(om.bytesWritten() + ws.bytes);
+        }
+    }
+
     private void writeBatch() {
-        currentBatchSize = 0;
+        updateStatistics();
         if (currentBatch.isEmpty()) {
+            currentBatchSize = 0;
             return;
         }
+        WriteStats currentStats = new WriteStats(currentBatch.size(), currentBatchSize);
+        currentBatchSize = 0;
 
         Value<?>[] copy = currentBatch.toArray(new Value<?>[0]);
         currentBatch = new ArrayList<>();
@@ -131,10 +149,13 @@ public abstract class YdbDataWriter implements DataWriter<InternalRow> {
 
         ListValue batch = ListValue.of(copy);
         CompletableFuture<Status> future = retryCtx.supplyStatus(session -> executeWrite(session, batch));
-        writesInFly.put(future, future);
+        writesInFly.put(future, currentStats);
 
         future.whenComplete((st, th) -> {
-            writesInFly.remove(future);
+            WriteStats ws = writesInFly.remove(future);
+            if (th == null && st != null && st.isSuccess()) {
+                writeStats.accumulateAndGet(ws, WriteStats::accumulate);
+            }
 
             if (st != null && !st.isSuccess()) {
                 lastError = st;
@@ -144,5 +165,30 @@ public abstract class YdbDataWriter implements DataWriter<InternalRow> {
             }
             semaphore.release();
         });
+    }
+
+    static class WriteStats {
+
+        final long rows;
+        final long bytes;
+
+        WriteStats(long rows, long bytes) {
+            this.rows = rows;
+            this.bytes = bytes;
+        }
+
+        boolean isNonZero() {
+            return rows > 0L || bytes > 0L;
+        }
+
+        static WriteStats accumulate(WriteStats x, WriteStats y) {
+            if (x == null) {
+                return y;
+            }
+            if (y == null) {
+                return x;
+            }
+            return new WriteStats(x.rows + y.rows, x.bytes + y.bytes);
+        }
     }
 }
